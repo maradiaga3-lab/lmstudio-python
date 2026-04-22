@@ -7,10 +7,14 @@
 
         from lmstudio.campaign_api import CampaignAPI
 
-    Campaigns themselves start as private (``is_public=False``).  A
-    campaign can be made publicly visible only after an authorised
-    permission token has been issued and presented via
-    :meth:`CampaignAPI.grant_publication`.
+Visibility model
+----------------
+* Stores (campaigns) start **private** and can be expanded to **public**
+  via a permission-token workflow.
+* The **owner** identity is always kept **secret**: it is stored internally
+  but never included in public-facing views or listings.
+* :meth:`CampaignAPI.public_view` returns a :class:`StorePublicView` that
+  exposes only the store name and public metadata — no secrets, no owner.
 """
 
 import hashlib
@@ -52,6 +56,21 @@ class SecretShare:
 
     index: int
     value: int
+
+
+@dataclass(frozen=True)
+class StorePublicView:
+    """Public-safe snapshot of a campaign/store.
+
+    Contains only what the world may see: name and public metadata.
+    Owner identity and API secret are **never** included.
+    """
+
+    name: str
+    metadata: dict[str, Any]
+
+    def __repr__(self) -> str:
+        return f"StorePublicView(name={self.name!r}, metadata={self.metadata!r})"
 
 
 class MPCSecretManager:
@@ -96,57 +115,66 @@ class MPCSecretManager:
 
 @dataclass
 class Campaign:
-    """A named campaign with a strong API secret for signing LLM interaction batches.
+    """A named campaign/store with a strong API secret and a private owner.
 
-    Campaigns are **private by default** (``is_public=False``).  Visibility
-    can only be changed through :meth:`CampaignAPI.grant_publication` after a
-    permission token has been issued via :meth:`CampaignAPI.request_publication`.
+    * ``owner`` — always secret; never surfaced in public views.
+    * ``secret`` — API secret for request signing; never surfaced publicly.
+    * ``is_public`` — controls whether the store appears in public listings.
+
+    Use :meth:`CampaignAPI.public_view` to obtain a safe, owner-free snapshot.
     """
 
     name: str
     secret: str
+    # Owner is stored privately; CampaignAPI never exposes it in public output
+    _owner: str = field(repr=False)
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     is_public: bool = False
 
     def sign(self, payload: str) -> str:
         """Return an HMAC-SHA256 hex signature for ``payload``."""
-        key = self.secret.encode()
-        return hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
+        return hmac.new(self.secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
     def verify(self, payload: str, signature: str) -> bool:
         """Return True iff ``signature`` matches the HMAC of ``payload``."""
-        expected = self.sign(payload)
-        return hmac.compare_digest(expected, signature)
+        return hmac.compare_digest(self.sign(payload), signature)
 
 
 class CampaignAPI:
-    """Manages LLM interaction campaigns with strong secrets and MPC distribution.
+    """Manages stores (campaigns) with public expansion and secret owner identity.
 
-    **Visibility model** — every campaign starts private.  To make one public:
+    **Owner stays secret** — owner info is held internally and never included
+    in public listings or :class:`StorePublicView` snapshots.
 
-    1. Call :meth:`request_publication` to obtain a single-use permission token.
-    2. Present that token to :meth:`grant_publication`; on success the campaign's
-       ``is_public`` flag is set to ``True`` and the token is consumed.
+    **Store visibility workflow**:
 
-    Only public campaigns appear in :meth:`list_public_names`.
+    1. :meth:`create` registers a store as private (``is_public=False``).
+    2. :meth:`request_publication` issues a single-use permission token.
+    3. :meth:`grant_publication` validates the token → store becomes public.
+    4. :meth:`list_public` returns :class:`StorePublicView` objects (no secrets).
 
-    Example usage::
+    Example::
 
         api = CampaignAPI()
-        campaign = api.create("summer-promo", metadata={"budget": 5000})
 
-        # Sign a request payload
-        sig = campaign.sign('{"model": "llama3", "prompt": "Write ad copy"}')
+        # Owner registers stores privately
+        api.create("voyagetrends", owner="me@example.com",
+                   metadata={"site": "voyagetrends.com"})
+        api.create("voyage-vault", owner="me@example.com",
+                   metadata={"site": "thevoyagevault.com"})
 
-        # Split the secret across 5 parties, reconstruct with any 3
-        shares = api.split_secret(campaign, n_shares=5, threshold=3)
-        recovered = api.reconstruct_secret(shares[:3])
+        # Request public expansion for each store
+        token_vt = api.request_publication("voyagetrends")
+        token_vv = api.request_publication("voyage-vault")
 
-        # Make the campaign public after permission is granted
-        token = api.request_publication("summer-promo")
-        api.grant_publication("summer-promo", token)
-        assert campaign.is_public
+        # Grant publication (present tokens)
+        api.grant_publication("voyagetrends", token_vt)
+        api.grant_publication("voyage-vault", token_vv)
+
+        # Public world sees stores — owner never exposed
+        for view in api.list_public():
+            print(view)   # StorePublicView(name=..., metadata={...})
     """
 
     def __init__(self) -> None:
@@ -163,15 +191,17 @@ class CampaignAPI:
         self,
         name: str,
         *,
+        owner: str,
         metadata: dict[str, Any] | None = None,
         secret_bytes: int = 32,
     ) -> Campaign:
-        """Create a new **private** campaign with a strong generated secret.
+        """Register a new **private** store with a secret owner identity.
 
         Args:
-            name: Unique campaign identifier.
-            metadata: Arbitrary key/value pairs to attach to the campaign.
-            secret_bytes: Entropy length for the generated secret (default 32 bytes).
+            name: Unique store identifier.
+            owner: Owner identifier — kept secret, never exposed publicly.
+            metadata: Public key/value pairs (site URL, category, etc.).
+            secret_bytes: Entropy for the generated API secret (default 32).
 
         Returns:
             The newly created :class:`Campaign` (``is_public=False``).
@@ -181,26 +211,49 @@ class CampaignAPI:
         campaign = Campaign(
             name=name,
             secret=generate_strong_secret(secret_bytes),
+            _owner=owner,
             metadata=metadata or {},
         )
         self._campaigns[name] = campaign
         return campaign
 
     def get(self, name: str) -> Campaign | None:
-        """Return the campaign with ``name``, or ``None`` if absent."""
+        """Return the full campaign record (owner visible), or ``None``."""
         return self._campaigns.get(name)
 
     def delete(self, name: str) -> None:
-        """Remove the campaign with ``name`` from the registry."""
+        """Remove the store and any pending publication token."""
         self._campaigns.pop(name, None)
         self._pending_publication_tokens.pop(name, None)
 
     def list_names(self) -> list[str]:
-        """Return the names of all registered campaigns (public and private)."""
+        """Return names of all stores (public and private)."""
         return list(self._campaigns)
 
+    # ------------------------------------------------------------------
+    # Public-facing views — owner and secret are never included
+    # ------------------------------------------------------------------
+
+    def public_view(self, name: str) -> StorePublicView | None:
+        """Return a public-safe view of a store, or ``None`` if not found."""
+        c = self._campaigns.get(name)
+        if c is None:
+            return None
+        return StorePublicView(name=c.name, metadata=dict(c.metadata))
+
+    def list_public(self) -> list[StorePublicView]:
+        """Return public-safe views of all publicly visible stores.
+
+        Owner identity and API secret are **never** included.
+        """
+        return [
+            StorePublicView(name=c.name, metadata=dict(c.metadata))
+            for c in self._campaigns.values()
+            if c.is_public
+        ]
+
     def list_public_names(self) -> list[str]:
-        """Return the names of campaigns that have been granted public visibility."""
+        """Return names of publicly visible stores."""
         return [name for name, c in self._campaigns.items() if c.is_public]
 
     # ------------------------------------------------------------------
@@ -208,13 +261,10 @@ class CampaignAPI:
     # ------------------------------------------------------------------
 
     def request_publication(self, name: str) -> str:
-        """Issue a single-use permission token to make campaign ``name`` public.
-
-        The token must be passed to :meth:`grant_publication` to take effect.
-        Calling this again for the same campaign replaces any pending token.
+        """Issue a single-use token to expand store ``name`` to public.
 
         Raises:
-            KeyError: If no campaign with ``name`` exists.
+            KeyError: If no store with ``name`` exists.
         """
         if name not in self._campaigns:
             raise KeyError(f"Campaign {name!r} not found.")
@@ -223,13 +273,13 @@ class CampaignAPI:
         return token
 
     def grant_publication(self, name: str, token: str) -> None:
-        """Make campaign ``name`` public by presenting a valid permission token.
+        """Make store ``name`` publicly visible by presenting a valid token.
 
-        The token is consumed on success (single-use).
+        Token is consumed on success (single-use).
 
         Raises:
-            KeyError: If no campaign with ``name`` exists.
-            PermissionError: If ``token`` is invalid or has already been used.
+            KeyError: If no store with ``name`` exists.
+            PermissionError: If ``token`` is invalid or already used.
         """
         if name not in self._campaigns:
             raise KeyError(f"Campaign {name!r} not found.")
@@ -238,15 +288,14 @@ class CampaignAPI:
             raise PermissionError(
                 f"Invalid or expired publication token for campaign {name!r}."
             )
-        # Consume the token and publish the campaign
         del self._pending_publication_tokens[name]
         self._campaigns[name].is_public = True
 
     def revoke_publication(self, name: str) -> None:
-        """Revert a public campaign back to private.
+        """Revert a public store back to private.
 
         Raises:
-            KeyError: If no campaign with ``name`` exists.
+            KeyError: If no store with ``name`` exists.
         """
         if name not in self._campaigns:
             raise KeyError(f"Campaign {name!r} not found.")
@@ -259,10 +308,7 @@ class CampaignAPI:
     def split_secret(
         self, campaign: Campaign, *, n_shares: int, threshold: int
     ) -> list[SecretShare]:
-        """Split ``campaign``'s secret into ``n_shares`` MPC shares.
-
-        Any ``threshold`` shares can reconstruct the secret; fewer cannot.
-        """
+        """Split ``campaign``'s secret into ``n_shares`` MPC shares."""
         secret_int = self._secret_to_int(campaign.secret)
         return self._mpc.split(secret_int, n_shares, threshold)
 
@@ -277,7 +323,6 @@ class CampaignAPI:
 
     @staticmethod
     def _secret_to_int(secret: str) -> int:
-        """Convert a secret token string to an integer for MPC operations."""
         raw = secret.removeprefix(_CAMPAIGN_TOKEN_PREFIX)
         value = (
             int(raw, 16)
@@ -290,6 +335,4 @@ class CampaignAPI:
 
     @staticmethod
     def _int_to_secret(value: int) -> str:
-        """Convert a reconstructed integer back to a secret token string."""
-        hex_str = format(value, "064x")
-        return f"{_CAMPAIGN_TOKEN_PREFIX}{hex_str}"
+        return f"{_CAMPAIGN_TOKEN_PREFIX}{format(value, '064x')}"

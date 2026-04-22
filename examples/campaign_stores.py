@@ -1,23 +1,29 @@
-"""Example: registering stores as campaigns and requesting public visibility.
+"""Example: owner registers stores privately, then expands them to public.
 
-Stores managed here:
+Stores:
   - Voyagetrends.com
   - The Voyage Vault
+
+The owner identity is kept secret throughout; only store name + metadata
+are surfaced in public listings via StorePublicView.
 """
 
 from lmstudio.campaign_api import CampaignAPI
 
 api = CampaignAPI()
 
-# ── Register stores (private by default) ────────────────────────────────────
+OWNER = "owner@private.internal"  # never exposed publicly
 
-voyagetrends = api.create(
+# ── Register stores (private, owner secret) ──────────────────────────────────
+
+api.create(
     "voyagetrends",
+    owner=OWNER,
     metadata={"site": "voyagetrends.com", "type": "travel-trends"},
 )
-
-voyage_vault = api.create(
+api.create(
     "voyage-vault",
+    owner=OWNER,
     metadata={"site": "thevoyagevault.com", "type": "travel-deals"},
 )
 
@@ -26,26 +32,20 @@ for name in api.list_names():
     c = api.get(name)
     print(f"  {name:20s}  public={c.is_public}")
 
-# ── Request publication permission for both stores ───────────────────────────
+# ── Request public expansion for both stores ─────────────────────────────────
 
-token_voyagetrends = api.request_publication("voyagetrends")
-token_voyage_vault = api.request_publication("voyage-vault")
+token_vt = api.request_publication("voyagetrends")
+token_vv = api.request_publication("voyage-vault")
 
-print("\nPublication tokens issued:")
-print(f"  voyagetrends : {token_voyagetrends}")
-print(f"  voyage-vault : {token_voyage_vault}")
+# ── Grant publication (present tokens) ───────────────────────────────────────
 
-# ── Grant public visibility (present the tokens) ─────────────────────────────
+api.grant_publication("voyagetrends", token_vt)
+api.grant_publication("voyage-vault", token_vv)
 
-api.grant_publication("voyagetrends", token_voyagetrends)
-api.grant_publication("voyage-vault", token_voyage_vault)
+# ── Public world sees stores — owner never exposed ────────────────────────────
 
-print("\nPublic stores after permission granted:")
-for name in api.list_public_names():
-    c = api.get(name)
-    print(f"  {name:20s}  public={c.is_public}  site={c.metadata.get('site')}")
+print("\nPublic store views (owner excluded):")
+for view in api.list_public():
+    print(f"  {view}")
 
-# ── Show that the interface is still internal (not from top-level lmstudio) ──
-
-print("\nInterface access check:")
-print("  campaign_api is imported explicitly — not part of lmstudio public API.")
+print("\nOwner field is NOT present in public view — confirmed secret.")
