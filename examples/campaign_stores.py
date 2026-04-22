@@ -1,63 +1,74 @@
-"""Example: stores with photos and videos, owner stays secret.
+"""Example: bridge between Voyagetrends and The Voyage Vault.
 
-Stores:
-  - Voyagetrends.com
-  - The Voyage Vault
+The two stores communicate through a secure, authenticated bridge.
+Only the owner (you) manages this — the interface stays secret.
 """
 
 from lmstudio.campaign_api import CampaignAPI
 
 api = CampaignAPI()
 
-OWNER = "owner@private.internal"  # never exposed publicly
+OWNER = "owner@private.internal"
 
 # ── Register stores ───────────────────────────────────────────────────────────
 
-api.create(
-    "voyagetrends",
-    owner=OWNER,
-    metadata={"site": "voyagetrends.com", "type": "travel-trends"},
-)
-api.create(
-    "voyage-vault",
-    owner=OWNER,
-    metadata={"site": "thevoyagevault.com", "type": "travel-deals"},
-)
+api.create("voyagetrends", owner=OWNER,
+           metadata={"site": "voyagetrends.com"})
+api.create("voyage-vault", owner=OWNER,
+           metadata={"site": "thevoyagevault.com"})
 
-# ── Add photos and videos ─────────────────────────────────────────────────────
+# ── Add media to each store ───────────────────────────────────────────────────
 
 api.add_media("voyagetrends", "photo", "assets/vt_hero.jpg",
-              caption="Explore the latest travel trends")
-api.add_media("voyagetrends", "photo", "assets/vt_destinations.jpg",
-              caption="Top destinations 2025")
+              caption="Latest travel trends")
 api.add_media("voyagetrends", "video", "assets/vt_intro.mp4",
               caption="Welcome to Voyagetrends", metadata={"duration_s": 30})
 
 api.add_media("voyage-vault", "photo", "assets/vv_deals.jpg",
-              caption="Exclusive travel deals")
+              caption="Exclusive deals")
 api.add_media("voyage-vault", "video", "assets/vv_promo.mp4",
-              caption="The Voyage Vault – your secret to travel savings",
-              metadata={"duration_s": 45})
+              caption="The Voyage Vault savings", metadata={"duration_s": 45})
 
-print("Media uploaded (private):")
-for store_name in api.list_names():
-    photos = api.list_media(store_name, "photo")
-    videos = api.list_media(store_name, "video")
-    print(f"  {store_name}: {len(photos)} photo(s), {len(videos)} video(s)")
+# ── Build the bridge between the two stores ───────────────────────────────────
 
-# ── Request and grant public expansion ───────────────────────────────────────
+bridge = api.bridge("voyagetrends", "voyage-vault")
+print(f"Bridge created: {bridge}\n")
 
-for store_name in api.list_names():
-    token = api.request_publication(store_name)
-    api.grant_publication(store_name, token)
+# ── Stores send signed messages to each other ─────────────────────────────────
 
-# ── Public world sees stores + media — owner never exposed ───────────────────
+bridge.send("voyagetrends", "Hey Vault! Let's cross-promote our summer deals.")
+bridge.send("voyage-vault", "Great idea! We'll feature your trends page too.")
+bridge.send("voyagetrends", "Deal. Sharing our hero photo with you now.")
 
-print("\nPublic store views:")
+# ── Read each store's inbox ───────────────────────────────────────────────────
+
+print("Voyage Vault inbox:")
+for msg in bridge.inbox("voyage-vault"):
+    valid = bridge.verify_message(msg)
+    print(f"  [{msg.sender} → {msg.recipient}] {msg.content!r}  ✓={valid}")
+
+print("\nVoyagetrends inbox:")
+for msg in bridge.inbox("voyagetrends"):
+    valid = bridge.verify_message(msg)
+    print(f"  [{msg.sender} → {msg.recipient}] {msg.content!r}  ✓={valid}")
+
+# ── Share media through the bridge ────────────────────────────────────────────
+
+shared = bridge.share_media("voyagetrends", "voyage-vault", asset_type="photo")
+print(f"\nVoyagetrends → Voyage Vault shared {len(shared)} photo(s):")
+for a in shared:
+    print(f"  {a}")
+
+print(f"\nVoyage Vault media now: "
+      f"{len(api.list_media('voyage-vault', 'photo'))} photo(s), "
+      f"{len(api.list_media('voyage-vault', 'video'))} video(s)")
+
+# ── Grant public expansion for both stores ────────────────────────────────────
+
+for name in api.list_names():
+    token = api.request_publication(name)
+    api.grant_publication(name, token)
+
+print("\nPublic views (owner never exposed):")
 for view in api.list_public():
-    print(f"\n  {view}")
-    for p in view.photos:
-        print(f"    📷  {p.caption}  ({p.url})")
-    for v in view.videos:
-        dur = v.metadata.get("duration_s", "?")
-        print(f"    🎬  {v.caption}  ({v.url}, {dur}s)")
+    print(f"  {view}")

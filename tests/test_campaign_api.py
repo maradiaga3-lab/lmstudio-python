@@ -451,3 +451,128 @@ class TestCampaignAPIMedia:
         a = self.api.add_media("store", "video", "v.mp4",
                                metadata={"duration_s": 60})
         assert a.metadata["duration_s"] == 60
+
+
+# ---------------------------------------------------------------------------
+# StoreBridge + BridgeMessage
+# ---------------------------------------------------------------------------
+
+
+class TestStoreBridge:
+    _OWNER = "owner@private.internal"
+
+    def setup_method(self):
+        self.api = CampaignAPI()
+        self.api.create("voyagetrends", owner=self._OWNER,
+                        metadata={"site": "voyagetrends.com"})
+        self.api.create("voyage-vault", owner=self._OWNER,
+                        metadata={"site": "thevoyagevault.com"})
+
+    def test_bridge_returns_store_bridge(self):
+        from lmstudio.campaign_api import StoreBridge
+        b = self.api.bridge("voyagetrends", "voyage-vault")
+        assert isinstance(b, StoreBridge)
+
+    def test_bridge_is_singleton(self):
+        b1 = self.api.bridge("voyagetrends", "voyage-vault")
+        b2 = self.api.bridge("voyage-vault", "voyagetrends")
+        assert b1 is b2
+
+    def test_bridge_self_raises(self):
+        with pytest.raises(ValueError):
+            self.api.bridge("voyagetrends", "voyagetrends")
+
+    def test_bridge_unknown_store_raises(self):
+        with pytest.raises(KeyError):
+            self.api.bridge("voyagetrends", "ghost")
+
+    def test_send_returns_bridge_message(self):
+        from lmstudio.campaign_api import BridgeMessage
+        b = self.api.bridge("voyagetrends", "voyage-vault")
+        msg = b.send("voyagetrends", "Hello!")
+        assert isinstance(msg, BridgeMessage)
+        assert msg.sender == "voyagetrends"
+        assert msg.recipient == "voyage-vault"
+        assert msg.content == "Hello!"
+
+    def test_send_unknown_sender_raises(self):
+        b = self.api.bridge("voyagetrends", "voyage-vault")
+        with pytest.raises(KeyError):
+            b.send("ghost", "hi")
+
+    def test_inbox_correct_recipient(self):
+        b = self.api.bridge("voyagetrends", "voyage-vault")
+        b.send("voyagetrends", "msg1")
+        b.send("voyage-vault", "msg2")
+        vt_inbox = b.inbox("voyagetrends")
+        vv_inbox = b.inbox("voyage-vault")
+        assert len(vt_inbox) == 1
+        assert vt_inbox[0].sender == "voyage-vault"
+        assert len(vv_inbox) == 1
+        assert vv_inbox[0].sender == "voyagetrends"
+
+    def test_inbox_unknown_store_raises(self):
+        b = self.api.bridge("voyagetrends", "voyage-vault")
+        with pytest.raises(KeyError):
+            b.inbox("ghost")
+
+    def test_verify_message_valid(self):
+        b = self.api.bridge("voyagetrends", "voyage-vault")
+        msg = b.send("voyagetrends", "Authentic message")
+        assert b.verify_message(msg) is True
+
+    def test_verify_message_tampered_content(self):
+        import dataclasses
+        b = self.api.bridge("voyagetrends", "voyage-vault")
+        msg = b.send("voyagetrends", "Real content")
+        tampered = dataclasses.replace(msg, content="Tampered!")
+        assert b.verify_message(tampered) is False
+
+    def test_verify_message_unknown_sender(self):
+        import dataclasses
+        from lmstudio.campaign_api import BridgeMessage
+        b = self.api.bridge("voyagetrends", "voyage-vault")
+        fake = BridgeMessage(sender="ghost", recipient="voyagetrends",
+                             content="x", signature="bad")
+        assert b.verify_message(fake) is False
+
+    def test_history_contains_all_messages(self):
+        b = self.api.bridge("voyagetrends", "voyage-vault")
+        b.send("voyagetrends", "A")
+        b.send("voyage-vault", "B")
+        b.send("voyagetrends", "C")
+        assert len(b.history()) == 3
+
+    def test_share_media_copies_assets(self):
+        self.api.add_media("voyagetrends", "photo", "hero.jpg", caption="Hero")
+        b = self.api.bridge("voyagetrends", "voyage-vault")
+        added = b.share_media("voyagetrends", "voyage-vault", asset_type="photo")
+        assert len(added) == 1
+        assert added[0].url == "hero.jpg"
+        assert len(self.api.list_media("voyage-vault", "photo")) == 1
+
+    def test_share_media_no_duplicates(self):
+        self.api.add_media("voyagetrends", "photo", "hero.jpg")
+        b = self.api.bridge("voyagetrends", "voyage-vault")
+        b.share_media("voyagetrends", "voyage-vault")
+        added2 = b.share_media("voyagetrends", "voyage-vault")
+        assert len(added2) == 0
+
+    def test_share_media_filter_by_type(self):
+        self.api.add_media("voyagetrends", "photo", "p.jpg")
+        self.api.add_media("voyagetrends", "video", "v.mp4")
+        b = self.api.bridge("voyagetrends", "voyage-vault")
+        added = b.share_media("voyagetrends", "voyage-vault", asset_type="video")
+        assert len(added) == 1
+        assert added[0].asset_type == "video"
+
+    def test_share_media_unknown_store_raises(self):
+        b = self.api.bridge("voyagetrends", "voyage-vault")
+        with pytest.raises(KeyError):
+            b.share_media("ghost", "voyagetrends")
+
+    def test_bridge_repr(self):
+        b = self.api.bridge("voyagetrends", "voyage-vault")
+        r = repr(b)
+        assert "voyagetrends" in r
+        assert "voyage-vault" in r

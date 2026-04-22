@@ -220,6 +220,8 @@ class CampaignAPI:
         self._mpc = MPCSecretManager()
         # Pending one-time publication tokens: campaign name → token
         self._pending_publication_tokens: dict[str, str] = {}
+        # Active bridges: frozenset({name_a, name_b}) → StoreBridge
+        self._bridges: dict[frozenset[str], "StoreBridge"] = {}
 
     # ------------------------------------------------------------------
     # Campaign lifecycle
@@ -454,3 +456,186 @@ class CampaignAPI:
     @staticmethod
     def _int_to_secret(value: int) -> str:
         return f"{_CAMPAIGN_TOKEN_PREFIX}{format(value, '064x')}"
+
+    # ------------------------------------------------------------------
+    # Store bridge
+    # ------------------------------------------------------------------
+
+    def bridge(self, name_a: str, name_b: str) -> "StoreBridge":
+        """Return (creating if needed) the bidirectional bridge between two stores.
+
+        The bridge lets the two stores send authenticated messages to each
+        other and share media assets.
+
+        Raises:
+            KeyError: If either store does not exist.
+            ValueError: If ``name_a == name_b``.
+        """
+        if name_a == name_b:
+            raise ValueError("A store cannot bridge to itself.")
+        for name in (name_a, name_b):
+            if name not in self._campaigns:
+                raise KeyError(f"Campaign {name!r} not found.")
+        key: frozenset[str] = frozenset({name_a, name_b})
+        if key not in self._bridges:
+            self._bridges[key] = StoreBridge(
+                self._campaigns[name_a],
+                self._campaigns[name_b],
+            )
+        return self._bridges[key]
+
+
+# ---------------------------------------------------------------------------
+# StoreBridge — bidirectional authenticated channel between two stores
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BridgeMessage:
+    """A signed message sent from one store to another through a bridge."""
+
+    sender: str
+    recipient: str
+    content: str
+    signature: str   # HMAC-SHA256 of ``content`` signed with sender's secret
+    sent_at: float = field(default_factory=time.time)
+
+    def __repr__(self) -> str:
+        preview = self.content[:40] + ("…" if len(self.content) > 40 else "")
+        return (
+            f"BridgeMessage(from={self.sender!r}, to={self.recipient!r}, "
+            f"content={preview!r})"
+        )
+
+
+class StoreBridge:
+    """Bidirectional authenticated communication channel between two stores.
+
+    Messages are signed with the sender's campaign secret and verified by
+    the recipient before delivery.  Media assets can also be pushed from
+    one store to the other through the bridge.
+
+    Obtain an instance via :meth:`CampaignAPI.bridge`.
+
+    Example::
+
+        bridge = api.bridge("voyagetrends", "voyage-vault")
+
+        # Send a signed message from voyagetrends to voyage-vault
+        bridge.send("voyagetrends", "Hey, let's cross-promote our deals!")
+
+        # voyage-vault reads its inbox
+        for msg in bridge.inbox("voyage-vault"):
+            print(msg)
+
+        # Share a photo from voyage-vault to voyagetrends
+        bridge.share_media("voyage-vault", "voyagetrends", asset_type="photo")
+    """
+
+    def __init__(self, store_a: Campaign, store_b: Campaign) -> None:
+        self._stores: dict[str, Campaign] = {
+            store_a.name: store_a,
+            store_b.name: store_b,
+        }
+        self._messages: list[BridgeMessage] = []
+
+    @property
+    def store_names(self) -> tuple[str, str]:
+        """Names of the two connected stores."""
+        names = list(self._stores)
+        return names[0], names[1]
+
+    def _peer(self, sender_name: str) -> Campaign:
+        """Return the *other* store given one side's name."""
+        names = list(self._stores)
+        return self._stores[names[1] if sender_name == names[0] else names[0]]
+
+    def send(self, sender_name: str, content: str) -> BridgeMessage:
+        """Send a signed message from ``sender_name`` to the other store.
+
+        The message is signed with the sender's campaign secret and verified
+        before being queued in the recipient's inbox.
+
+        Raises:
+            KeyError: If ``sender_name`` is not one of the two bridged stores.
+        """
+        if sender_name not in self._stores:
+            raise KeyError(f"{sender_name!r} is not part of this bridge.")
+        sender = self._stores[sender_name]
+        recipient = self._peer(sender_name)
+        signature = sender.sign(content)
+        msg = BridgeMessage(
+            sender=sender_name,
+            recipient=recipient.name,
+            content=content,
+            signature=signature,
+            sent_at=time.time(),
+        )
+        # Verify before storing (guards against internal corruption)
+        if not sender.verify(content, signature):
+            raise ValueError("Message signature verification failed unexpectedly.")
+        self._messages.append(msg)
+        return msg
+
+    def inbox(self, store_name: str) -> list[BridgeMessage]:
+        """Return all messages addressed to ``store_name``, oldest first.
+
+        Raises:
+            KeyError: If ``store_name`` is not one of the two bridged stores.
+        """
+        if store_name not in self._stores:
+            raise KeyError(f"{store_name!r} is not part of this bridge.")
+        return [m for m in self._messages if m.recipient == store_name]
+
+    def verify_message(self, msg: BridgeMessage) -> bool:
+        """Return True if ``msg``'s signature is valid for its sender's secret."""
+        sender = self._stores.get(msg.sender)
+        if sender is None:
+            return False
+        return sender.verify(msg.content, msg.signature)
+
+    def share_media(
+        self,
+        from_name: str,
+        to_name: str,
+        *,
+        asset_type: "MediaType | None" = None,
+    ) -> list[MediaAsset]:
+        """Copy media assets from one store to the other through the bridge.
+
+        Args:
+            from_name: Store providing the assets.
+            to_name: Store receiving the assets.
+            asset_type: ``"photo"``, ``"video"``, or ``None`` for all.
+
+        Returns:
+            List of assets that were copied.
+
+        Raises:
+            KeyError: If either name is not part of this bridge.
+        """
+        for name in (from_name, to_name):
+            if name not in self._stores:
+                raise KeyError(f"{name!r} is not part of this bridge.")
+        source = self._stores[from_name]
+        target = self._stores[to_name]
+        assets = (
+            source.media
+            if asset_type is None
+            else [a for a in source.media if a.asset_type == asset_type]
+        )
+        existing_urls = {a.url for a in target.media}
+        added: list[MediaAsset] = []
+        for asset in assets:
+            if asset.url not in existing_urls:
+                target.media.append(asset)
+                added.append(asset)
+        return added
+
+    def history(self) -> list[BridgeMessage]:
+        """Return the full message history of this bridge, oldest first."""
+        return list(self._messages)
+
+    def __repr__(self) -> str:
+        a, b = self.store_names
+        return f"StoreBridge({a!r} ↔ {b!r}, messages={len(self._messages)})"
