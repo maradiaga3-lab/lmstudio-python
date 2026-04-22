@@ -1,11 +1,8 @@
-"""Example: owner registers stores privately, then expands them to public.
+"""Example: stores with photos and videos, owner stays secret.
 
 Stores:
   - Voyagetrends.com
   - The Voyage Vault
-
-The owner identity is kept secret throughout; only store name + metadata
-are surfaced in public listings via StorePublicView.
 """
 
 from lmstudio.campaign_api import CampaignAPI
@@ -14,7 +11,7 @@ api = CampaignAPI()
 
 OWNER = "owner@private.internal"  # never exposed publicly
 
-# ── Register stores (private, owner secret) ──────────────────────────────────
+# ── Register stores ───────────────────────────────────────────────────────────
 
 api.create(
     "voyagetrends",
@@ -27,25 +24,40 @@ api.create(
     metadata={"site": "thevoyagevault.com", "type": "travel-deals"},
 )
 
-print("Stores registered (private):")
-for name in api.list_names():
-    c = api.get(name)
-    print(f"  {name:20s}  public={c.is_public}")
+# ── Add photos and videos ─────────────────────────────────────────────────────
 
-# ── Request public expansion for both stores ─────────────────────────────────
+api.add_media("voyagetrends", "photo", "assets/vt_hero.jpg",
+              caption="Explore the latest travel trends")
+api.add_media("voyagetrends", "photo", "assets/vt_destinations.jpg",
+              caption="Top destinations 2025")
+api.add_media("voyagetrends", "video", "assets/vt_intro.mp4",
+              caption="Welcome to Voyagetrends", metadata={"duration_s": 30})
 
-token_vt = api.request_publication("voyagetrends")
-token_vv = api.request_publication("voyage-vault")
+api.add_media("voyage-vault", "photo", "assets/vv_deals.jpg",
+              caption="Exclusive travel deals")
+api.add_media("voyage-vault", "video", "assets/vv_promo.mp4",
+              caption="The Voyage Vault – your secret to travel savings",
+              metadata={"duration_s": 45})
 
-# ── Grant publication (present tokens) ───────────────────────────────────────
+print("Media uploaded (private):")
+for store_name in api.list_names():
+    photos = api.list_media(store_name, "photo")
+    videos = api.list_media(store_name, "video")
+    print(f"  {store_name}: {len(photos)} photo(s), {len(videos)} video(s)")
 
-api.grant_publication("voyagetrends", token_vt)
-api.grant_publication("voyage-vault", token_vv)
+# ── Request and grant public expansion ───────────────────────────────────────
 
-# ── Public world sees stores — owner never exposed ────────────────────────────
+for store_name in api.list_names():
+    token = api.request_publication(store_name)
+    api.grant_publication(store_name, token)
 
-print("\nPublic store views (owner excluded):")
+# ── Public world sees stores + media — owner never exposed ───────────────────
+
+print("\nPublic store views:")
 for view in api.list_public():
-    print(f"  {view}")
-
-print("\nOwner field is NOT present in public view — confirmed secret.")
+    print(f"\n  {view}")
+    for p in view.photos:
+        print(f"    📷  {p.caption}  ({p.url})")
+    for v in view.videos:
+        dur = v.metadata.get("duration_s", "?")
+        print(f"    🎬  {v.caption}  ({v.url}, {dur}s)")

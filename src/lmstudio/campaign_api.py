@@ -22,7 +22,7 @@ import hmac
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 
 # Mersenne prime suitable for Shamir's Secret Sharing over GF(p)
@@ -33,6 +33,9 @@ _CAMPAIGN_TOKEN_PREFIX = "sk-cam-"
 
 # Prefix for one-time publication-permission tokens
 _PUBLICATION_TOKEN_PREFIX = "pub-permit-"
+
+# Allowed media asset types
+MediaType = Literal["photo", "video"]
 
 
 def generate_strong_secret(byte_length: int = 32) -> str:
@@ -58,19 +61,53 @@ class SecretShare:
     value: int
 
 
+@dataclass
+class MediaAsset:
+    """A photo or video asset attached to a store campaign.
+
+    Args:
+        asset_type: ``"photo"`` or ``"video"``.
+        url: Location of the asset (local path or remote URL).
+        caption: Optional human-readable description.
+        metadata: Arbitrary extra data (dimensions, duration, tags, …).
+        uploaded_at: Unix timestamp when the asset was registered.
+    """
+
+    asset_type: MediaType
+    url: str
+    caption: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    uploaded_at: float = field(default_factory=time.time)
+
+    def __post_init__(self) -> None:
+        if self.asset_type not in ("photo", "video"):
+            raise ValueError(f"asset_type must be 'photo' or 'video', got {self.asset_type!r}")
+
+    def __repr__(self) -> str:
+        return (
+            f"MediaAsset(type={self.asset_type!r}, url={self.url!r}, "
+            f"caption={self.caption!r})"
+        )
+
+
 @dataclass(frozen=True)
 class StorePublicView:
     """Public-safe snapshot of a campaign/store.
 
-    Contains only what the world may see: name and public metadata.
+    Contains only what the world may see: name, public metadata, and media.
     Owner identity and API secret are **never** included.
     """
 
     name: str
     metadata: dict[str, Any]
+    photos: list[MediaAsset]
+    videos: list[MediaAsset]
 
     def __repr__(self) -> str:
-        return f"StorePublicView(name={self.name!r}, metadata={self.metadata!r})"
+        return (
+            f"StorePublicView(name={self.name!r}, "
+            f"photos={len(self.photos)}, videos={len(self.videos)})"
+        )
 
 
 class MPCSecretManager:
@@ -131,6 +168,7 @@ class Campaign:
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     is_public: bool = False
+    media: list[MediaAsset] = field(default_factory=list)
 
     def sign(self, payload: str) -> str:
         """Return an HMAC-SHA256 hex signature for ``payload``."""
@@ -239,22 +277,102 @@ class CampaignAPI:
         c = self._campaigns.get(name)
         if c is None:
             return None
-        return StorePublicView(name=c.name, metadata=dict(c.metadata))
+        return self._make_public_view(c)
 
     def list_public(self) -> list[StorePublicView]:
         """Return public-safe views of all publicly visible stores.
 
         Owner identity and API secret are **never** included.
+        Media assets (photos and videos) are included in the view.
         """
-        return [
-            StorePublicView(name=c.name, metadata=dict(c.metadata))
-            for c in self._campaigns.values()
-            if c.is_public
-        ]
+        return [self._make_public_view(c) for c in self._campaigns.values() if c.is_public]
 
     def list_public_names(self) -> list[str]:
         """Return names of publicly visible stores."""
         return [name for name, c in self._campaigns.items() if c.is_public]
+
+    @staticmethod
+    def _make_public_view(c: "Campaign") -> StorePublicView:
+        photos = [a for a in c.media if a.asset_type == "photo"]
+        videos = [a for a in c.media if a.asset_type == "video"]
+        return StorePublicView(
+            name=c.name,
+            metadata=dict(c.metadata),
+            photos=list(photos),
+            videos=list(videos),
+        )
+
+    # ------------------------------------------------------------------
+    # Media management
+    # ------------------------------------------------------------------
+
+    def add_media(
+        self,
+        name: str,
+        asset_type: MediaType,
+        url: str,
+        *,
+        caption: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> MediaAsset:
+        """Attach a photo or video asset to store ``name``.
+
+        Args:
+            name: Store identifier.
+            asset_type: ``"photo"`` or ``"video"``.
+            url: File path or remote URL of the asset.
+            caption: Optional description shown publicly.
+            metadata: Extra data (dimensions, duration, tags, …).
+
+        Returns:
+            The newly created :class:`MediaAsset`.
+
+        Raises:
+            KeyError: If no store with ``name`` exists.
+        """
+        if name not in self._campaigns:
+            raise KeyError(f"Campaign {name!r} not found.")
+        asset = MediaAsset(
+            asset_type=asset_type,
+            url=url,
+            caption=caption,
+            metadata=metadata or {},
+        )
+        self._campaigns[name].media.append(asset)
+        return asset
+
+    def list_media(
+        self,
+        name: str,
+        asset_type: MediaType | None = None,
+    ) -> list[MediaAsset]:
+        """Return media assets for store ``name``, optionally filtered by type.
+
+        Raises:
+            KeyError: If no store with ``name`` exists.
+        """
+        if name not in self._campaigns:
+            raise KeyError(f"Campaign {name!r} not found.")
+        assets = self._campaigns[name].media
+        if asset_type is not None:
+            return [a for a in assets if a.asset_type == asset_type]
+        return list(assets)
+
+    def remove_media(self, name: str, url: str) -> bool:
+        """Remove the media asset with ``url`` from store ``name``.
+
+        Returns:
+            ``True`` if an asset was removed, ``False`` if not found.
+
+        Raises:
+            KeyError: If no store with ``name`` exists.
+        """
+        if name not in self._campaigns:
+            raise KeyError(f"Campaign {name!r} not found.")
+        media = self._campaigns[name].media
+        before = len(media)
+        self._campaigns[name].media = [a for a in media if a.url != url]
+        return len(self._campaigns[name].media) < before
 
     # ------------------------------------------------------------------
     # Publication permission workflow

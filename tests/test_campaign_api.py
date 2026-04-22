@@ -4,6 +4,7 @@ import pytest
 from lmstudio.campaign_api import (
     Campaign,
     CampaignAPI,
+    MediaAsset,
     MPCSecretManager,
     SecretShare,
     StorePublicView,
@@ -331,3 +332,122 @@ class TestCampaignAPI:
         with pytest.raises(PermissionError):
             self.api.grant_publication("replace", old_token)
         self.api.grant_publication("replace", new_token)  # new token works
+
+
+# ---------------------------------------------------------------------------
+# MediaAsset
+# ---------------------------------------------------------------------------
+
+
+class TestMediaAsset:
+    def test_photo_type(self):
+        a = MediaAsset(asset_type="photo", url="img.jpg")
+        assert a.asset_type == "photo"
+
+    def test_video_type(self):
+        a = MediaAsset(asset_type="video", url="clip.mp4")
+        assert a.asset_type == "video"
+
+    def test_invalid_type_raises(self):
+        with pytest.raises(ValueError, match="asset_type"):
+            MediaAsset(asset_type="gif", url="x.gif")  # type: ignore
+
+    def test_defaults(self):
+        a = MediaAsset(asset_type="photo", url="x.jpg")
+        assert a.caption == ""
+        assert a.metadata == {}
+
+    def test_repr_excludes_uploaded_at(self):
+        a = MediaAsset(asset_type="photo", url="x.jpg", caption="Hi")
+        r = repr(a)
+        assert "photo" in r
+        assert "x.jpg" in r
+
+
+# ---------------------------------------------------------------------------
+# CampaignAPI – media management
+# ---------------------------------------------------------------------------
+
+
+class TestCampaignAPIMedia:
+    _OWNER = "owner@private.internal"
+
+    def setup_method(self):
+        self.api = CampaignAPI()
+        self.api.create("store", owner=self._OWNER, metadata={"site": "example.com"})
+
+    def test_add_photo_returns_asset(self):
+        a = self.api.add_media("store", "photo", "img.jpg", caption="A photo")
+        assert isinstance(a, MediaAsset)
+        assert a.asset_type == "photo"
+        assert a.url == "img.jpg"
+        assert a.caption == "A photo"
+
+    def test_add_video_returns_asset(self):
+        a = self.api.add_media("store", "video", "clip.mp4")
+        assert a.asset_type == "video"
+
+    def test_add_media_unknown_store_raises(self):
+        with pytest.raises(KeyError):
+            self.api.add_media("ghost", "photo", "x.jpg")
+
+    def test_list_media_all(self):
+        self.api.add_media("store", "photo", "a.jpg")
+        self.api.add_media("store", "video", "b.mp4")
+        assert len(self.api.list_media("store")) == 2
+
+    def test_list_media_filter_photo(self):
+        self.api.add_media("store", "photo", "a.jpg")
+        self.api.add_media("store", "video", "b.mp4")
+        photos = self.api.list_media("store", "photo")
+        assert len(photos) == 1
+        assert photos[0].asset_type == "photo"
+
+    def test_list_media_filter_video(self):
+        self.api.add_media("store", "photo", "a.jpg")
+        self.api.add_media("store", "video", "b.mp4")
+        videos = self.api.list_media("store", "video")
+        assert len(videos) == 1
+        assert videos[0].asset_type == "video"
+
+    def test_list_media_unknown_store_raises(self):
+        with pytest.raises(KeyError):
+            self.api.list_media("ghost")
+
+    def test_remove_media_returns_true(self):
+        self.api.add_media("store", "photo", "rm.jpg")
+        assert self.api.remove_media("store", "rm.jpg") is True
+        assert len(self.api.list_media("store")) == 0
+
+    def test_remove_media_missing_url_returns_false(self):
+        assert self.api.remove_media("store", "not-there.jpg") is False
+
+    def test_remove_media_unknown_store_raises(self):
+        with pytest.raises(KeyError):
+            self.api.remove_media("ghost", "x.jpg")
+
+    def test_public_view_includes_media(self):
+        self.api.add_media("store", "photo", "p.jpg", caption="P")
+        self.api.add_media("store", "video", "v.mp4", caption="V")
+        token = self.api.request_publication("store")
+        self.api.grant_publication("store", token)
+        views = self.api.list_public()
+        assert len(views) == 1
+        view = views[0]
+        assert len(view.photos) == 1
+        assert len(view.videos) == 1
+        assert view.photos[0].caption == "P"
+        assert view.videos[0].caption == "V"
+
+    def test_public_view_owner_not_in_media(self):
+        self.api.add_media("store", "photo", "p.jpg", caption="P")
+        token = self.api.request_publication("store")
+        self.api.grant_publication("store", token)
+        view = self.api.list_public()[0]
+        for asset in view.photos + view.videos:
+            assert self._OWNER not in repr(asset)
+
+    def test_media_metadata_stored(self):
+        a = self.api.add_media("store", "video", "v.mp4",
+                               metadata={"duration_s": 60})
+        assert a.metadata["duration_s"] == 60
