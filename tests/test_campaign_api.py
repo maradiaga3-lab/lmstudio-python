@@ -8,6 +8,7 @@ from lmstudio.campaign_api import (
     SecretShare,
     generate_strong_secret,
     _CAMPAIGN_TOKEN_PREFIX,
+    _PUBLICATION_TOKEN_PREFIX,
     _PRIME,
 )
 
@@ -197,3 +198,93 @@ class TestCampaignAPI:
         c = self.api.create("signer")
         payload = "test payload"
         assert c.verify(payload, c.sign(payload))
+
+    # ------------------------------------------------------------------
+    # Visibility: private by default, public via permission token
+    # ------------------------------------------------------------------
+
+    def test_new_campaign_is_private(self):
+        c = self.api.create("private-store")
+        assert c.is_public is False
+
+    def test_list_public_names_empty_initially(self):
+        self.api.create("a")
+        self.api.create("b")
+        assert self.api.list_public_names() == []
+
+    def test_request_publication_returns_prefixed_token(self):
+        self.api.create("store")
+        token = self.api.request_publication("store")
+        assert token.startswith(_PUBLICATION_TOKEN_PREFIX)
+
+    def test_grant_publication_makes_campaign_public(self):
+        c = self.api.create("store")
+        token = self.api.request_publication("store")
+        self.api.grant_publication("store", token)
+        assert c.is_public is True
+
+    def test_grant_publication_appears_in_public_list(self):
+        self.api.create("public-store")
+        self.api.create("private-store")
+        token = self.api.request_publication("public-store")
+        self.api.grant_publication("public-store", token)
+        public = self.api.list_public_names()
+        assert "public-store" in public
+        assert "private-store" not in public
+
+    def test_grant_publication_token_is_single_use(self):
+        self.api.create("once")
+        token = self.api.request_publication("once")
+        self.api.grant_publication("once", token)
+        with pytest.raises(PermissionError):
+            self.api.grant_publication("once", token)
+
+    def test_grant_publication_wrong_token_raises(self):
+        self.api.create("wrong")
+        self.api.request_publication("wrong")
+        with pytest.raises(PermissionError):
+            self.api.grant_publication("wrong", "bad-token")
+
+    def test_grant_publication_without_request_raises(self):
+        self.api.create("no-request")
+        with pytest.raises(PermissionError):
+            self.api.grant_publication("no-request", "any-token")
+
+    def test_request_publication_unknown_campaign_raises(self):
+        with pytest.raises(KeyError):
+            self.api.request_publication("ghost")
+
+    def test_grant_publication_unknown_campaign_raises(self):
+        with pytest.raises(KeyError):
+            self.api.grant_publication("ghost", "tok")
+
+    def test_revoke_publication_makes_private(self):
+        c = self.api.create("reversible")
+        token = self.api.request_publication("reversible")
+        self.api.grant_publication("reversible", token)
+        assert c.is_public is True
+        self.api.revoke_publication("reversible")
+        assert c.is_public is False
+
+    def test_revoke_publication_unknown_campaign_raises(self):
+        with pytest.raises(KeyError):
+            self.api.revoke_publication("ghost")
+
+    def test_delete_removes_pending_token(self):
+        self.api.create("temp")
+        token = self.api.request_publication("temp")
+        self.api.delete("temp")
+        # Recreate with the same name; old token must not work
+        self.api.create("temp")
+        self.api.request_publication("temp")  # issue a new token
+        with pytest.raises(PermissionError):
+            self.api.grant_publication("temp", token)  # old token rejected
+
+    def test_new_token_replaces_pending_token(self):
+        self.api.create("replace")
+        old_token = self.api.request_publication("replace")
+        new_token = self.api.request_publication("replace")
+        assert old_token != new_token
+        with pytest.raises(PermissionError):
+            self.api.grant_publication("replace", old_token)
+        self.api.grant_publication("replace", new_token)  # new token works

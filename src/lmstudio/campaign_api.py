@@ -1,4 +1,17 @@
-"""Campaign API with MPC-based secret sharing and strong secret generation."""
+"""Campaign API with MPC-based secret sharing and strong secret generation.
+
+.. note::
+    This module is **intentionally not exported** from the top-level
+    ``lmstudio`` package.  It is an internal interface whose symbols must
+    be imported explicitly::
+
+        from lmstudio.campaign_api import CampaignAPI
+
+    Campaigns themselves start as private (``is_public=False``).  A
+    campaign can be made publicly visible only after an authorised
+    permission token has been issued and presented via
+    :meth:`CampaignAPI.grant_publication`.
+"""
 
 import hashlib
 import hmac
@@ -13,6 +26,9 @@ _PRIME = 2**521 - 1
 
 # Token prefix matching LM Studio token conventions
 _CAMPAIGN_TOKEN_PREFIX = "sk-cam-"
+
+# Prefix for one-time publication-permission tokens
+_PUBLICATION_TOKEN_PREFIX = "pub-permit-"
 
 
 def generate_strong_secret(byte_length: int = 32) -> str:
@@ -80,12 +96,18 @@ class MPCSecretManager:
 
 @dataclass
 class Campaign:
-    """A named campaign with a strong API secret for signing LLM interaction batches."""
+    """A named campaign with a strong API secret for signing LLM interaction batches.
+
+    Campaigns are **private by default** (``is_public=False``).  Visibility
+    can only be changed through :meth:`CampaignAPI.grant_publication` after a
+    permission token has been issued via :meth:`CampaignAPI.request_publication`.
+    """
 
     name: str
     secret: str
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
+    is_public: bool = False
 
     def sign(self, payload: str) -> str:
         """Return an HMAC-SHA256 hex signature for ``payload``."""
@@ -101,6 +123,14 @@ class Campaign:
 class CampaignAPI:
     """Manages LLM interaction campaigns with strong secrets and MPC distribution.
 
+    **Visibility model** — every campaign starts private.  To make one public:
+
+    1. Call :meth:`request_publication` to obtain a single-use permission token.
+    2. Present that token to :meth:`grant_publication`; on success the campaign's
+       ``is_public`` flag is set to ``True`` and the token is consumed.
+
+    Only public campaigns appear in :meth:`list_public_names`.
+
     Example usage::
 
         api = CampaignAPI()
@@ -112,12 +142,18 @@ class CampaignAPI:
         # Split the secret across 5 parties, reconstruct with any 3
         shares = api.split_secret(campaign, n_shares=5, threshold=3)
         recovered = api.reconstruct_secret(shares[:3])
-        assert recovered == campaign.secret
+
+        # Make the campaign public after permission is granted
+        token = api.request_publication("summer-promo")
+        api.grant_publication("summer-promo", token)
+        assert campaign.is_public
     """
 
     def __init__(self) -> None:
         self._campaigns: dict[str, Campaign] = {}
         self._mpc = MPCSecretManager()
+        # Pending one-time publication tokens: campaign name → token
+        self._pending_publication_tokens: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Campaign lifecycle
@@ -130,7 +166,7 @@ class CampaignAPI:
         metadata: dict[str, Any] | None = None,
         secret_bytes: int = 32,
     ) -> Campaign:
-        """Create a new campaign with a strong generated secret.
+        """Create a new **private** campaign with a strong generated secret.
 
         Args:
             name: Unique campaign identifier.
@@ -138,7 +174,7 @@ class CampaignAPI:
             secret_bytes: Entropy length for the generated secret (default 32 bytes).
 
         Returns:
-            The newly created :class:`Campaign`.
+            The newly created :class:`Campaign` (``is_public=False``).
         """
         if name in self._campaigns:
             raise ValueError(f"Campaign {name!r} already exists.")
@@ -157,10 +193,64 @@ class CampaignAPI:
     def delete(self, name: str) -> None:
         """Remove the campaign with ``name`` from the registry."""
         self._campaigns.pop(name, None)
+        self._pending_publication_tokens.pop(name, None)
 
     def list_names(self) -> list[str]:
-        """Return the names of all registered campaigns."""
+        """Return the names of all registered campaigns (public and private)."""
         return list(self._campaigns)
+
+    def list_public_names(self) -> list[str]:
+        """Return the names of campaigns that have been granted public visibility."""
+        return [name for name, c in self._campaigns.items() if c.is_public]
+
+    # ------------------------------------------------------------------
+    # Publication permission workflow
+    # ------------------------------------------------------------------
+
+    def request_publication(self, name: str) -> str:
+        """Issue a single-use permission token to make campaign ``name`` public.
+
+        The token must be passed to :meth:`grant_publication` to take effect.
+        Calling this again for the same campaign replaces any pending token.
+
+        Raises:
+            KeyError: If no campaign with ``name`` exists.
+        """
+        if name not in self._campaigns:
+            raise KeyError(f"Campaign {name!r} not found.")
+        token = f"{_PUBLICATION_TOKEN_PREFIX}{secrets.token_hex(24)}"
+        self._pending_publication_tokens[name] = token
+        return token
+
+    def grant_publication(self, name: str, token: str) -> None:
+        """Make campaign ``name`` public by presenting a valid permission token.
+
+        The token is consumed on success (single-use).
+
+        Raises:
+            KeyError: If no campaign with ``name`` exists.
+            PermissionError: If ``token`` is invalid or has already been used.
+        """
+        if name not in self._campaigns:
+            raise KeyError(f"Campaign {name!r} not found.")
+        expected = self._pending_publication_tokens.get(name)
+        if expected is None or not hmac.compare_digest(expected, token):
+            raise PermissionError(
+                f"Invalid or expired publication token for campaign {name!r}."
+            )
+        # Consume the token and publish the campaign
+        del self._pending_publication_tokens[name]
+        self._campaigns[name].is_public = True
+
+    def revoke_publication(self, name: str) -> None:
+        """Revert a public campaign back to private.
+
+        Raises:
+            KeyError: If no campaign with ``name`` exists.
+        """
+        if name not in self._campaigns:
+            raise KeyError(f"Campaign {name!r} not found.")
+        self._campaigns[name].is_public = False
 
     # ------------------------------------------------------------------
     # MPC secret distribution
@@ -189,7 +279,11 @@ class CampaignAPI:
     def _secret_to_int(secret: str) -> int:
         """Convert a secret token string to an integer for MPC operations."""
         raw = secret.removeprefix(_CAMPAIGN_TOKEN_PREFIX)
-        value = int(raw, 16) if all(c in "0123456789abcdef" for c in raw) else int.from_bytes(raw.encode(), "big")
+        value = (
+            int(raw, 16)
+            if all(c in "0123456789abcdef" for c in raw)
+            else int.from_bytes(raw.encode(), "big")
+        )
         if value >= _PRIME:
             value %= _PRIME
         return value
